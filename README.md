@@ -20,20 +20,17 @@ feedback on the proposed solution. It has not been approved to ship in Chrome.
 - [Introduction](#introduction)
 - [Goals](#goals)
 - [Non-goals](#non-goals)
-- [User research](#user-research)
 - [Use cases](#use-cases)
-  - [Use case 1](#use-case-1)
-  - [Use case 2](#use-case-2)
-- [[Potential Solution]](#potential-solution)
+  - [Use case 1: Diagnosing micro-stutters in the Webium Product](#use-case-1-diagnosing-micro-stutters-in-the-webium-product)
+  - [Use case 2: Real User Monitoring (RUM) and Telemetry](#use-case-2-real-user-monitoring-rum-and-telemetry)
+- [Potential Solution](#potential-solution)
   - [How this solution would solve the use cases](#how-this-solution-would-solve-the-use-cases)
-    - [Use case 1](#use-case-1-1)
-    - [Use case 2](#use-case-2-1)
 - [Detailed design discussion](#detailed-design-discussion)
-  - [[Tricky design choice #1]](#tricky-design-choice-1)
-  - [[Tricky design choice 2]](#tricky-design-choice-2)
+  - [Mid-execution interrupts vs. Post-mortem aggregation](#mid-execution-interrupts-vs-post-mortem-aggregation)
+  - [Lock-free task observation](#lock-free-task-observation)
 - [Considered alternatives](#considered-alternatives)
-  - [[Alternative 1]](#alternative-1)
-  - [[Alternative 2]](#alternative-2)
+  - [Long Animation Frames (LoAF) API](#long-animation-frames-loaf-api)
+  - [Long Tasks API](#long-tasks-api)
 - [Security and Privacy Considerations](#security-and-privacy-considerations)
 - [Stakeholder Feedback / Opposition](#stakeholder-feedback--opposition)
 - [References & acknowledgements](#references--acknowledgements)
@@ -81,7 +78,7 @@ Performance analytics providers (e.g., third-party RUM scripts) currently strugg
 <!-- In your initial explainer, you shouldn't be attached or appear attached to any of the potential
 solutions you describe below this. -->
 
-## [Potential Solution]
+## Potential Solution
 
 We propose introducing a new `PerformanceObserver` entry type: `task-interrupt`. 
 
