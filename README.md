@@ -151,9 +151,6 @@ Because the browser must observe every single task on the main thread to measure
 
 ## Considered alternatives
 
-[This should include as many alternatives as you can,
-from high level architectural decisions down to alternative naming choices.]
-
 ### Long Animation Frames (LoAF) API
 
 The Long Animation Frames API is a fantastic tool for measuring responsiveness, but it is fundamentally unsuited for this specific use case for two reasons:
@@ -176,18 +173,10 @@ To mitigate this, the API must be strictly guarded. We propose the following sec
 
 ## Stakeholder Feedback / Opposition
 
-[Implementors and other stakeholders may already have publicly stated positions on this work. If you can, list them here with links to evidence as appropriate.]
-
 - Chrome/WebUI : Positive (Driving initial incubation)
 - Web Performance WG : Invited for discussion
 
-[If appropriate, explain the reasons given by other implementors for their concerns.]
-
 ## References & acknowledgements
-
-[Your design will change and be informed by many people; acknowledge them in an ongoing way! It helps build community and, as we only get by through the contributions of many, is only fair.]
-
-[Unless you have a specific reason not to, these should be in alphabetical order.]
 
 Many thanks for valuable feedback and advice from:
 
