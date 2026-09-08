@@ -62,11 +62,6 @@ The **Task Interrupt Timing API** proposes a new `PerformanceObserver` entry typ
 * **Replacing DevTools Profilers:** This API is for programmatic, lightweight monitoring in the wild, not for capturing full continuous CPU profiles.
 
 
-## User research
-
-[If any user research has been conducted to inform your design choices,
-discuss the process and findings. User research should be more common than it is.]
-
 ## Use cases
 
 This proposal is primarily driven by the performance requirements of the **Webium Product project**, which needs strict, programmatic control over main-thread responsiveness to deliver a stutter-free user experience. Webium's requirements highlight a broader challenge faced by complex, highly interactive web applications.
@@ -78,7 +73,10 @@ In the Webium Product, even small tasks (e.g., 5-15ms) can cause noticeable micr
 
 Current post-mortem tools only provide aggregated script attribution after a long frame finishes, which is insufficient for Webium's diagnostic needs. By capturing a precise, point-in-time stack trace exactly when a short threshold is exceeded, the Webium team (and developers of similar complex apps) can pinpoint and eliminate the exact source of main-thread contention in the wild.
 
-### Use case 2
+### Use case 2: Real User Monitoring (RUM) and Telemetry
+
+Performance analytics providers (e.g., third-party RUM scripts) currently struggle to report actionable main-thread contention data from actual users. While they can report that a user experienced a long frame, they cannot programmatically capture the offending JavaScript stack trace to send back to the server. This API would allow telemetry scripts to automatically capture and aggregate point-in-time stack traces for tasks that violate performance SLAs in production, giving site owners actionable data to fix jank.
+
 
 <!-- In your initial explainer, you shouldn't be attached or appear attached to any of the potential
 solutions you describe below this. -->
@@ -127,17 +125,10 @@ observer.observe({
 });
 ```
 
-#### Use case 1
+For both strict performance budgeting (like the Webium Product) and Real User Monitoring (RUM), developers can deploy the `PerformanceObserver` shown above. 
 
-[Description of the end-user scenario]
+When a custom budget (e.g., 10ms) is violated, the `stackTrace` is synchronously captured by the browser engine and surfaced in the `PerformanceTaskInterruptTiming` entry. The developer's script can then read this entry and beacon the exact function name and line number back to their telemetry backend, completely eliminating the guesswork in diagnosing production jank.
 
-```js
-// Sample code demonstrating how to use these APIs to address that scenario.
-```
-
-#### Use case 2
-
-[etc.]
 
 ## Detailed design discussion
 
