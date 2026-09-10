@@ -82,7 +82,7 @@ solutions you describe below this. -->
 
 We propose introducing a new `PerformanceObserver` entry type: `task-interrupt`. 
 
-Developers can configure the observer with a custom `durationThreshold`. When a JavaScript task begins on the main thread, a background monitor starts a timer. If the task continues executing past the `durationThreshold`, the browser requests an immediate interrupt from the JavaScript engine (e.g., V8). 
+Developers can configure the observer with a custom `durationThreshold`. When a JavaScript task begins on the main thread, a background monitor starts a timer. If the task continues executing past the `durationThreshold`, the browser requests an immediate interrupt from the JavaScript engine. 
 
 At the next safe execution point, the engine captures the current execution stack trace. Once the task finally completes, a `PerformanceTaskInterruptTiming` entry is dispatched to the observer.
 
@@ -152,12 +152,19 @@ The Long Tasks API measures tasks rather than frames, which aligns closer to our
 
 ## Security and Privacy Considerations
 
-Exposing raw JavaScript stack traces to the web platform introduces significant privacy and security risks. Specifically, a malicious script could potentially use this API to read the call stacks of third-party scripts or cross-origin iframes, leaking sensitive execution data.
+Exposing raw JavaScript stack traces to the web platform introduces significant privacy and security risks. Specifically, a malicious site could embed a cross-origin resource (such as a third-party script) and use this API to observe its internal execution flow. By reading the function names in the stack trace, the attacker could infer sensitive user state (e.g., inferring authentication status based on which code paths are executing).
 
-To mitigate this, the API must be strictly guarded. We propose the following security model:
+To mitigate this cross-origin data leakage while keeping the API usable on general websites (which often rely on ads and analytics), we propose stack truncation at cross-origin boundaries.
 
-1. Cross-Origin Isolation: The task-interrupt API should be restricted to secure contexts and gated behind strict Cross-Origin Isolation headers (Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy), similar to how SharedArrayBuffer and high-resolution timers (performance.now()) are protected against side-channel attacks today.
-2. Same-Origin Filtering: If Cross-Origin Isolation is deemed insufficient, the API will scrub or redact any frames in the stackTrace array that originate from cross-origin scripts unless appropriate CORS headers are present.
+Instead of strictly requiring Cross-Origin Isolation (COOP/COEP) for the entire page, the API will filter out any non-CORS third-party frames from the stack trace, keeping only the direct entry point called by the first-party script.
+
+For example:
+
+1. `myFirstPartyFunction()`
+2. `thirdPartyEntry()` ⬅ Boundary kept (Actionable for the developer)
+3. `[Filtered non-CORS frames]` ⬅ Internal state hidden (Privacy maintained)
+
+This surgical truncation ensures developers know exactly which external call blocked the thread, while completely hiding the internal execution state of that opaque script.
 
 ## Stakeholder Feedback / Opposition
 
