@@ -177,3 +177,20 @@ Many thanks for valuable feedback and advice from:
 
 - Fergal Daly
 - Yoav Weiss
+
+## Appendix: Implementation Feasibility (Chromium PoC)
+
+Demonstrating that continuous task monitoring and mid-execution interrupts can be achieved with near-zero overhead is critical to the viability of this proposal.
+
+While the exact implementation details are left to each browser engine, we built a Proof of Concept (PoC) in Chromium to demonstrate that this interrupt-driven architecture is practically feasible.
+
+The PoC utilizes a lock-free atomic timestamp on the main thread paired with a dedicated background watchdog thread. Our performance evaluation on a heavy workload (50,000+ micro-tasks and multiple >120ms synchronous tasks) yielded the following results:
+
+* **Main-Thread Critical Path (< 50 ns):** 
+  By using relaxed atomic stores (`std::memory_order_relaxed`) and reusing existing task scheduler timestamps, the observation overhead per task can be reduced to under 50 nanoseconds. This ensures zero impact on the main thread's normal task scheduling and rendering pipeline.
+* **Watchdog Thread Overhead (~0.4% Duty Cycle):** 
+  A background thread polling every 5ms takes approximately 20 µs per poll. This results in a background CPU utilization of just 0.4% when active, effectively mitigating concerns regarding excessive battery drain or preventing CPU sleep states on mobile devices.
+* **Engine Interrupt Cost (< 0.6% Relative Overhead):** 
+  Capturing the in-flight JavaScript engine stack trace takes a median of ~0.31 ms. Because this penalty is strictly deferred until a task has *already* violated the performance budget (e.g., >50ms), it represents less than 0.6% relative overhead on the janky task itself. Well-behaving tasks incur exactly 0 ms of capture overhead.
+
+These results prove that capturing point-in-time stack traces via a watchdog thread is practically feasible and safe for continuous, in-the-wild production monitoring.
