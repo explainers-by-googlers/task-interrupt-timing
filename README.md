@@ -190,7 +190,7 @@ The PoC utilizes a lock-free atomic timestamp on the main thread paired with a d
   By using relaxed atomic stores (`std::memory_order_relaxed`) and reusing existing task scheduler timestamps, the observation overhead per task can be reduced to under 50 nanoseconds. This ensures zero impact on the main thread's normal task scheduling and rendering pipeline.
 * **Watchdog Thread Overhead (~0.4% Duty Cycle):** 
   A background thread polling every 5ms takes approximately 20 µs per poll. This results in a background CPU utilization of just 0.4% when active, effectively mitigating concerns regarding excessive battery drain or preventing CPU sleep states on mobile devices.
-* **Engine Interrupt Cost (< 0.6% Relative Overhead):** 
-  Capturing the in-flight JavaScript engine stack trace takes a median of ~0.31 ms. Because this penalty is strictly deferred until a task has *already* violated the performance budget (e.g., >50ms), it represents less than 0.6% relative overhead on the janky task itself. Well-behaving tasks incur exactly 0 ms of capture overhead.
+* **Engine Interrupt Cost (< 6% Relative Overhead):** 
+  Capturing the in-flight JavaScript engine stack trace takes a median of ~0.31 ms. Because this penalty is strictly deferred until a task has *already* violated the performance budget (e.g., 5ms), it represents less than 6% relative overhead on the janky task itself. Well-behaving tasks incur exactly 0 ms of capture overhead.
 
 These results prove that capturing point-in-time stack traces via a watchdog thread is practically feasible and safe for continuous, in-the-wild production monitoring.
