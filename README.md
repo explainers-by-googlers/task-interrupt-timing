@@ -1,6 +1,6 @@
 # Explainer for Jankiness Measurement API
 
-This proposal is an early design sketch by [Chrome Webium] to describe the problem below and solicit
+This proposal is an early design sketch by [elkurin@chromium.org] to describe the problem below and solicit
 feedback on the proposed solution. It has not been approved to ship in Chrome.
 
 
