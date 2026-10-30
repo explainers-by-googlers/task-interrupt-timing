@@ -159,10 +159,10 @@ To avoid battery regressions and side-channel leaks:
 
 ### Lazy stack symbolization and slow-device guardrails
 
-In our initial Chromium prototype, capturing and eagerly symbolizing a V8 stack trace at the interrupt safe point takes a median of `~0.31ms` (`0.00ms` for healthy scripts below the threshold). At a `50ms` threshold this is `~0.6%`, and at a `10ms–15ms` threshold it is `~2–3%`.
+In our initial Chromium prototype, capturing and eagerly symbolizing a V8 stack trace at the interrupt safe point took `~114 µs–258 µs` (`0.11 ms–0.26 ms` median thread CPU time across 5- to 40-frame call stacks, and `0.00 ms` for healthy scripts below the threshold). Over half of that in-band pause was spent in Blink parsing `KURL`s, creating `SecurityOrigin` instances for cross-origin truncation, and formatting strings—rather than walking the V8 stack itself.
 
-To minimize overhead further—especially on slower devices:
-1. **Lazy stack symbolization:** During the V8 safe-point interrupt (`OnInterrupt`), the engine only needs to capture lightweight raw stack frame references (script ID, function handle, bytecode offset / line+column), deferring string formatting and URL origin parsing until the `PerformanceScriptTiming` entry is finalized or read. (If a script is garbage-collected before lazy symbolization occurs, affected frames degrade gracefully.)
+To minimize safe-point pause time—especially on slower devices:
+1. **Lazy stack symbolization (implemented in [CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720)):** During the V8 safe-point interrupt (`OnInterrupt`), `TaskInterruptMonitor::CaptureRawStackFrames()` only extracts raw frame fields without URL parsing, `SecurityOrigin` allocation, or string formatting, deferring `FilterAndFormatStackFrames()` until the `PerformanceScriptTiming` entry is finalized/consumed after script completion. In Release A/B benchmarks, this cuts the V8 safe-point pause by **52%–64%** down to **`55 µs` (5 frames) – `93 µs` (40 frames)** (`< 0.1 ms`). Looking ahead, V8 can further reduce this to `< 10 µs` by copying only raw `(script_id, bytecode_offset)` integer pairs at the safe point before materializing strings post-task. (If a script is garbage-collected before lazy symbolization occurs, affected frames degrade gracefully.)
 2. **Slow-device guardrails (breach-storm rate limiting):** On low-end devices experiencing continuous back-to-back threshold breaches, the user agent can apply a token-bucket cooldown so excess breaches continue reporting LoAF timing metrics while temporarily skipping V8 stack capture interrupts.
 
 ### Handling multiple observers with different thresholds
@@ -241,11 +241,19 @@ Many thanks for valuable feedback and advice from:
 
 ## Appendix: Implementation Feasibility (Chromium Prototype)
 
-We built and verified an end-to-end Chromium prototype extending both `TaskInterruptMonitor` and LoAF's `PerformanceScriptTiming.stackTrace` ([CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720), stacked on [CL 8350623](https://chromium-review.googlesource.com/c/chromium/src/+/8350623)):
+We built and verified an end-to-end Chromium prototype extending `TaskInterruptMonitor`, LoAF's `PerformanceScriptTiming.stackTrace`, and configurable sub-50ms `durationThreshold` on `"long-animation-frame"` observers ([CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720), stacked on [CL 8350623](https://chromium-review.googlesource.com/c/chromium/src/+/8350623)):
 
 * **Healthy Tasks (`< durationThreshold` — `0.00 ms` Overhead):**
   Tasks that complete within the threshold trigger zero V8 interrupts and incur `0.00 ms` (`0%`) main-thread overhead.
 * **Watchdog Thread (`0%` CPU When Idle):**
   The watchdog thread blocks on a condition variable (`cv.Wait()`) when no main-thread task is running (`0%` CPU) and uses `cv.TimedWait()` for the remaining threshold duration when a task starts.
-* **Breach Capture Cost (`~0.31 ms` Eager, Further Reducible via Lazy Symbolization):**
-  When a script breaches `durationThreshold`, capturing and eagerly formatting the V8 stack trace at the safe point takes a median of `~0.31 ms` (`P90: 0.42 ms`), which `AnimationFrameTimingMonitor` attaches directly to `ScriptTimingInfo` / `PerformanceScriptTiming.stackTrace`. Deferring string symbolization out of the safe point is expected to reduce the in-band interrupt pause even further.
+* **V8 Safe-Point Capture Cost (`55 µs–93 µs` with Lazy Symbolization — 52%–64% Reduction):**
+  Deferring `KURL` parsing, `SecurityOrigin::Create()` cross-origin checks, and `StringBuilder` string formatting out of `TaskInterruptMonitor::OnInterrupt()` until script/task completion cuts the in-band V8 safe-point pause by **52%–64%** across call stack depths in Release builds (`is_debug=false`, `dcheck_always_on=false`):
+
+| Call Stack Depth | Eager Safe-Point `P50 (median)` (95% CI) | Lazy Safe-Point `P50 (median)` (95% CI) | Safe-Point `P50 (median)` Reduction | Eager `P90` $\to$ Lazy `P90` | Deferred Post-Script Formatting `P50 (median)` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **5 frames** | `114.0 µs` (`[110.0, 119.5]`) | **`55.0 µs`** (`[54.0, 58.0]`) | **`-59.0 µs` (`-51.8%`)** | `156.2 µs` $\to$ `82.1 µs` (`-47.4%`) | `53.0 µs` (`[52.0, 54.0]`) |
+| **15 frames** | `154.5 µs` (`[152.0, 161.0]`) | **`64.0 µs`** (`[62.0, 69.0]`) | **`-90.5 µs` (`-58.6%`)** | `238.3 µs` $\to$ `107.0 µs` (`-55.1%`) | `78.0 µs` (`[77.0, 78.5]`) |
+| **40 frames** | `258.0 µs` (`[252.0, 263.5]`) | **`93.0 µs`** (`[90.0, 96.0]`) | **`-165.0 µs` (`-64.0%`)** | `353.1 µs` $\to$ `147.0 µs` (`-58.4%`) | `131.0 µs` (`[129.0, 134.0]`) |
+
+*(Values above report thread CPU duration `thread_dur` from 160–200 Perfetto `TaskInterruptCapture` / `TaskInterruptFormat` slices per variant across 5 interleaved Release A/B browser runs per depth with mixed same-origin and cross-origin script URLs; wall-clock `dur` reductions are `-50.2%`, `-58.3%`, and `-63.4%` respectively.)*
