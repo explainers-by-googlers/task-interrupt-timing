@@ -10,6 +10,7 @@ feedback on the proposed solution. It has not been approved to ship in Chrome.
 - Fergal Daly (@fergald)
 
 ## Participate
+- https://github.com/w3c/long-animation-frames/issues/47
 - https://github.com/explainers-by-googlers/task-interrupt-timing/issues
 - https://github.com/WICG/proposals/issues/312
 
@@ -92,7 +93,7 @@ Exposing `stackTrace` directly on `PerformanceScriptTiming` allows RUM scripts t
 
 ## Proposed Solution: Extending Long Animation Frames (LoAF)
 
-When a `"long-animation-frame"` observer opts in via `takeTracing: true` (and optionally specifies a `durationThreshold`), a background watchdog tracks main-thread execution duration. If execution continues past `durationThreshold`, the browser requests a one-shot interrupt from the JavaScript engine (`v8::Isolate::RequestInterrupt`). At the next V8 safe point, the engine captures the current call stack, truncates any non-CORS cross-origin frames, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry.
+When a `"long-animation-frame"` observer opts in via `takeTracing: true` (and optionally specifies a `durationThreshold`), a background watchdog tracks main-thread execution duration. If execution continues past `durationThreshold`, the browser requests a one-shot interrupt from the JavaScript engine. At the next safe point, the engine captures the current call stack, applies LoAF's opaque-script filtering rules, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry.
 
 ### WebIDL
 
@@ -159,15 +160,13 @@ To avoid battery regressions and side-channel leaks:
 
 ### Lazy stack symbolization and slow-device guardrails
 
-In our initial Chromium prototype, capturing and eagerly symbolizing a V8 stack trace at the interrupt safe point took `~114 µs–258 µs` (`0.11 ms–0.26 ms` median thread CPU time across 5- to 40-frame call stacks, and `0.00 ms` for healthy scripts below the threshold). Over half of that in-band pause was spent in Blink parsing `KURL`s, creating `SecurityOrigin` instances for cross-origin truncation, and formatting strings—rather than walking the V8 stack itself.
-
-To minimize safe-point pause time—especially on slower devices:
-1. **Lazy stack symbolization (implemented in [CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720)):** During the V8 safe-point interrupt (`OnInterrupt`), `TaskInterruptMonitor::CaptureRawStackFrames()` only extracts raw frame fields without URL parsing, `SecurityOrigin` allocation, or string formatting, deferring `FilterAndFormatStackFrames()` until the `PerformanceScriptTiming` entry is finalized/consumed after script completion. In Release A/B benchmarks, this cuts the V8 safe-point pause by **52%–64%** down to **`55 µs` (5 frames) – `93 µs` (40 frames)** (`< 0.1 ms`). Looking ahead, V8 can further reduce this to `< 10 µs` by copying only raw `(script_id, bytecode_offset)` integer pairs at the safe point before materializing strings post-task. (If a script is garbage-collected before lazy symbolization occurs, affected frames degrade gracefully.)
-2. **Slow-device guardrails (breach-storm rate limiting):** On low-end devices experiencing continuous back-to-back threshold breaches, the user agent can apply a token-bucket cooldown so excess breaches continue reporting LoAF timing metrics while temporarily skipping V8 stack capture interrupts.
+To minimize in-band pause time when an interrupt fires—especially on slower devices:
+1. **Lazy stack symbolization:** During the JS engine safe-point interrupt, the browser only records lightweight frame references (or `(script_id, bytecode_offset)` pairs) without URL normalization, opaque-script filtering, or string formatting, deferring symbolization and formatting until after the script finishes. (If a script is garbage-collected before lazy symbolization occurs, affected frames degrade gracefully.)
+2. **Slow-device guardrails (breach-storm rate limiting):** On low-end devices experiencing continuous back-to-back threshold breaches, the user agent can apply a token-bucket cooldown so excess breaches continue reporting LoAF timing metrics while temporarily skipping stack capture interrupts.
 
 ### Handling multiple observers with different thresholds
 
-When multiple `"long-animation-frame"` observers are registered on the same page with different `durationThreshold` values (e.g., Observer A at `15ms` and Observer B at `50ms`), each observer receives notifications according to its own configured threshold, while the page-level watchdog schedules interrupts at the active thresholds (or samples at the minimum active threshold) so observers do not clobber one another's configuration.
+When multiple `"long-animation-frame"` observers are registered on the same page with different `durationThreshold` values (e.g., Observer A at `15ms` and Observer B at `50ms`), each observer receives frame entries according to its own configured threshold, while the browser captures **at most one stack trace per script** (shared across observers) so staggered thresholds cannot be used as a sampling profiler.
 
 ### Lock-free task observation and zero-CPU idle suspension
 
@@ -207,16 +206,15 @@ A global setter such as `performance.setInterruptDuration(ms)` was rejected beca
 
 ## Security and Privacy Considerations
 
-Exposing raw JavaScript stack traces to the web platform introduces cross-origin privacy and security risks if a page embeds a cross-origin script and inspects its internal call stack to infer user state.
+Exposing JavaScript stack traces must preserve Long Animation Frames' existing [opaque script mitigations](https://w3c.github.io/long-animation-frames/#loaf-opaque-scripts-sec) ([exposed source URL](https://w3c.github.io/long-animation-frames/#script-exposed-source-url) and [apply source location](https://w3c.github.io/long-animation-frames/#apply-source-location)) for classic scripts whose **muted errors** flag is true (`no-cors` scripts and code dynamically evaluated inside them):
 
-To mitigate cross-origin leakage without requiring full Cross-Origin Isolation (`COOP`/`COEP`), the API enforces **cross-origin stack truncation** (consistent with CORS / same-origin attribution rules):
+* **Keyed on `muted errors` & pre-redirect URL:** Frame opacity is determined by the script's **muted errors** flag (not URL origin comparison), and frame URLs use the script's pre-redirect [exposed source URL](https://w3c.github.io/long-animation-frames/#script-exposed-source-url) (ignoring `//# sourceURL=` comments on muted scripts and collapsing `data:` URLs to `"data:"`).
+* **No capture for muted script entries or opaque innermost frames:** `stackTrace` is `[]` when the `PerformanceScriptTiming` entry itself is a muted classic script (preserving `executionStart = startTime`) or when the innermost frame at the interrupt has `muted errors` set.
+* **Opaque boundary truncation & single capture per script:** When non-opaque code is called through an opaque frame lower on the stack, `stackTrace` stops at that boundary frame and exposes only its pre-redirect `sourceURL` (with no function name, line, or column), and at most one stack is captured per script across all observers:
 
-* All frames that are same-origin with the document (or loaded via CORS) are included in `stackTrace`.
-* When a same-origin frame calls into a non-CORS cross-origin script, only the first boundary entry frame is retained (so developers can see which external call was invoked), and all internal contiguous cross-origin frames are omitted:
-
-1. `myFirstPartyFunction (https://app.example/main.js:42:5)`
-2. `thirdPartyEntry (https://cdn.other.example/sdk.js:10:1)` ⬅ Boundary kept
-3. `[Internal non-CORS cross-origin frames omitted]` ⬅ Internal state hidden
+1. `myFirstPartyCallback (https://app.example/main.js:42:5)` ⬅ Non-opaque frame kept in full
+2. `(https://cdn.other.example/sdk.js)` ⬅ Opaque boundary keeps only exposed `sourceURL`
+3. `[Caller frames below opaque boundary omitted]`
 
 
 ## Stakeholder Feedback / Opposition
@@ -248,7 +246,7 @@ We built and verified an end-to-end Chromium prototype extending `TaskInterruptM
 * **Watchdog Thread (`0%` CPU When Idle):**
   The watchdog thread blocks on a condition variable (`cv.Wait()`) when no main-thread task is running (`0%` CPU) and uses `cv.TimedWait()` for the remaining threshold duration when a task starts.
 * **V8 Safe-Point Capture Cost (`55 µs–93 µs` with Lazy Symbolization — 52%–64% Reduction):**
-  Deferring `KURL` parsing, `SecurityOrigin::Create()` cross-origin checks, and `StringBuilder` string formatting out of `TaskInterruptMonitor::OnInterrupt()` until script/task completion cuts the in-band V8 safe-point pause by **52%–64%** across call stack depths in Release builds (`is_debug=false`, `dcheck_always_on=false`):
+  Deferring opaque-frame truncation, URL filtering, and `StringBuilder` string formatting out of `TaskInterruptMonitor::OnInterrupt()` until script/task completion cuts the in-band V8 safe-point pause by **52%–64%** across call stack depths in Release builds (`is_debug=false`, `dcheck_always_on=false`):
 
 | Call Stack Depth | Eager Safe-Point `P50 (median)` (95% CI) | Lazy Safe-Point `P50 (median)` (95% CI) | Safe-Point `P50 (median)` Reduction | Eager `P90` $\to$ Lazy `P90` | Deferred Post-Script Formatting `P50 (median)` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
