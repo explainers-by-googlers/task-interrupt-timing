@@ -93,7 +93,7 @@ Exposing `stackTrace` directly on `PerformanceScriptTiming` allows RUM scripts t
 
 ## Proposed Solution: Extending Long Animation Frames (LoAF)
 
-When a `"long-animation-frame"` observer opts in via `takeTracing: true` (and optionally specifies a `durationThreshold`), a background watchdog tracks main-thread execution duration. If execution continues past `durationThreshold`, the browser requests a one-shot interrupt from the JavaScript engine. At the next safe point, the engine captures the current call stack, applies LoAF's opaque-script filtering rules, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry.
+When a `"long-animation-frame"` observer opts in via `takeTracing: true`, a background watchdog tracks main-thread script execution duration. If a script continues past a single predetermined script interrupt threshold (e.g., `7ms` in the Chromium prototype, slightly above LoAF's `5ms` long-script threshold and common scheduler yield quantums), the browser requests a one-shot interrupt from the JavaScript engine. At the next safe point, the engine captures the current call stack, applies LoAF's opaque-script filtering rules, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry. Independently, `durationThreshold` on `PerformanceObserver.observe()` acts purely as an observer filter for the overall LoAF animation frame duration (allowing observers to receive frames shorter than the `50ms` default).
 
 ### WebIDL
 
@@ -103,11 +103,18 @@ partial dictionary PerformanceObserverInit {
     boolean takeTracing = false;
 };
 
+dictionary PerformanceStackFrame {
+    DOMString functionName = "";
+    DOMString sourceURL = "";
+    long long sourceLine = -1;
+    long long sourceColumn = -1;
+};
+
 partial interface PerformanceScriptTiming {
     // The point-in-time call stack captured when the threshold was crossed,
     // ordered top-down from the interrupted leaf frame to the outer entry point.
     // Populated when observed with takeTracing: true (empty array otherwise).
-    readonly attribute FrozenArray<DOMString> stackTrace;
+    readonly attribute FrozenArray<PerformanceStackFrame> stackTrace;
 };
 ```
 
@@ -126,10 +133,13 @@ const observer = new PerformanceObserver((list) => {
   for (const frame of list.getEntries()) {
     for (const script of frame.scripts) {
       if (script.stackTrace?.length) {
+        const formattedFrames = script.stackTrace
+          .map(f => `${f.functionName || '<anonymous>'} (${f.sourceURL}:${f.sourceLine}:${f.sourceColumn})`)
+          .join('\n    ');
         console.warn(
           `Janky script (${script.invoker}, ${script.duration}ms) in frame (${frame.duration}ms):\n` +
           `  Entry point: ${script.sourceFunctionName} (${script.sourceURL}:${script.sourceCharPosition})\n` +
-          `  Stack trace at threshold:\n    ${script.stackTrace.join('\n    ')}`
+          `  Stack trace at threshold:\n    ${formattedFrames}`
         );
       }
     }
@@ -152,11 +162,11 @@ LoAF's existing `PerformanceScriptTiming` records post-mortem entry-point attrib
 
 ### OS timer resolution clamping (10ms–15ms), battery life, and side channels
 
-On Windows, the default OS timer tick interval is `15.625ms` (64 Hz). Supporting sub-10ms watchdog wakeups on Windows would require switching the OS into a high-resolution timer mode (`timeBeginPeriod`), which prevents deep CPU sleep states and degrades battery life. Furthermore, while browsers already enter high-resolution timer mode under specific conditions (such as when running on AC power or playing media), dynamically varying the minimum allowed `durationThreshold` based on whether high-resolution timers are currently active would create a privacy side channel leaking power/timer state.
+LoAF already records scripts $\ge 5\text{ms}$, and many userland schedulers treat `5ms` as their standard yield quantum. Setting a single predetermined script interrupt threshold slightly above that boundary (e.g., `6ms–10ms`) avoids interrupting tasks that are just about to yield while ensuring that any long script inside a LoAF frame (even a `15ms` script inside a default `50ms` frame) receives a stack trace.
 
-To avoid battery regressions and side-channel leaks:
-* **Production minimum clamp (`10ms–15ms`):** User agents clamp `durationThreshold` to a fixed minimum (e.g., `10ms` or `15ms`) in normal production browsing, which still captures the vast majority of actionable jank—especially when aggregated across real user sessions.
-* **Developer mode / local debugging override:** For local lab profiling or controlled internal environments (such as Webium development builds), browsers may offer a local developer flag or Permissions Policy override to allow lower thresholds without affecting general web battery life.
+On Windows, the default OS system tick interval is `15.625ms` (64 Hz); while modern Windows 10 (1803+) provides [`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createwaitabletimerexw) for short waitable timer delays without globally raising the system tick via `timeBeginPeriod`, user agents must still avoid battery regressions or leaking power/timer state across configurations:
+* **Production minimum clamp:** User agents use a fixed predetermined script interrupt interval (e.g., `6ms–10ms`) and clamp `durationThreshold` to a fixed minimum (e.g., `10ms–15ms`) in normal production browsing.
+* **Developer mode / local debugging override:** For local lab profiling or controlled internal environments (such as Webium development builds), browsers may offer a local developer flag or policy override to allow lower thresholds without affecting general web battery life.
 
 ### Lazy stack symbolization and slow-device guardrails
 
@@ -166,7 +176,7 @@ To minimize in-band pause time when an interrupt fires—especially on slower de
 
 ### Handling multiple observers with different thresholds
 
-When multiple `"long-animation-frame"` observers are registered on the same page with different `durationThreshold` values (e.g., Observer A at `15ms` and Observer B at `50ms`), each observer receives frame entries according to its own configured threshold, while the browser captures **at most one stack trace per script** (shared across observers) so staggered thresholds cannot be used as a sampling profiler.
+Because the script interrupt fires at a **single predetermined script duration** whenever tracing is active—rather than at each observer's `durationThreshold`—the browser captures **at most one stack trace per script** and shares it across all `takeTracing: true` observers, while each observer's `durationThreshold` (e.g., Observer A at `15ms` and Observer B at `50ms`) simply controls which LoAF frames that observer receives. This decoupling ensures both that shorter scripts (`10ms–20ms`) inside a `50ms` frame still get stack traces and that staggered observer thresholds (`10, 11, 12ms`) cannot be used as a high-frequency sampling profiler.
 
 ### Lock-free task observation and zero-CPU idle suspension
 
@@ -210,10 +220,10 @@ Exposing JavaScript stack traces must preserve Long Animation Frames' existing [
 
 * **Keyed on `muted errors` & pre-redirect URL:** Frame opacity is determined by the script's **muted errors** flag (not URL origin comparison), and frame URLs use the script's pre-redirect [exposed source URL](https://w3c.github.io/long-animation-frames/#script-exposed-source-url) (ignoring `//# sourceURL=` comments on muted scripts and collapsing `data:` URLs to `"data:"`).
 * **No capture for muted script entries or opaque innermost frames:** `stackTrace` is `[]` when the `PerformanceScriptTiming` entry itself is a muted classic script (preserving `executionStart = startTime`) or when the innermost frame at the interrupt has `muted errors` set.
-* **Opaque boundary truncation & single capture per script:** When non-opaque code is called through an opaque frame lower on the stack, `stackTrace` stops at that boundary frame and exposes only its pre-redirect `sourceURL` (with no function name, line, or column), and at most one stack is captured per script across all observers:
+* **Opaque boundary truncation & single capture per script:** When non-opaque code is called through an opaque frame lower on the stack, `stackTrace` stops at that boundary frame and exposes only its pre-redirect `sourceURL` (with `functionName = ""` and `sourceLine = sourceColumn = -1`), and at most one stack is captured per script across all observers:
 
-1. `myFirstPartyCallback (https://app.example/main.js:42:5)` ⬅ Non-opaque frame kept in full
-2. `(https://cdn.other.example/sdk.js)` ⬅ Opaque boundary keeps only exposed `sourceURL`
+1. `{ functionName: "myFirstPartyCallback", sourceURL: "https://app.example/main.js", sourceLine: 42, sourceColumn: 5 }` ⬅ Non-opaque frame kept in full
+2. `{ functionName: "", sourceURL: "https://cdn.other.example/sdk.js", sourceLine: -1, sourceColumn: -1 }` ⬅ Opaque boundary keeps only exposed `sourceURL`
 3. `[Caller frames below opaque boundary omitted]`
 
 
