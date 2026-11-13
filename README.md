@@ -32,15 +32,16 @@ feedback on the proposed solution. It has not been approved to ship in Chrome.
   - [How this solution would solve the use cases](#how-this-solution-would-solve-the-use-cases)
 - [Detailed design discussion](#detailed-design-discussion)
   - [Combining entry-point attribution with mid-execution interrupts](#combining-entry-point-attribution-with-mid-execution-interrupts)
-  - [OS timer resolution clamping (10ms–15ms), battery life, and side channels](#os-timer-resolution-clamping-10ms15ms-battery-life-and-side-channels)
+  - [Predetermined script interrupt threshold, battery life, and side channels](#predetermined-script-interrupt-threshold-battery-life-and-side-channels)
   - [Lazy stack symbolization and slow-device guardrails](#lazy-stack-symbolization-and-slow-device-guardrails)
-  - [Handling multiple observers with different thresholds](#handling-multiple-observers-with-different-thresholds)
+  - [Single capture per script across observers](#single-capture-per-script-across-observers)
   - [Lock-free task observation and zero-CPU idle suspension](#lock-free-task-observation-and-zero-cpu-idle-suspension)
 - [Considered alternatives](#considered-alternatives)
   - [Extending legacy `PerformanceLongTaskTiming` (`longtask`)](#extending-legacy-performancelongtasktiming-longtask)
   - [Dedicated `task-interrupt` entry type](#dedicated-task-interrupt-entry-type)
   - [JS Self-Profiling API (`Profiler`)](#js-self-profiling-api-profiler)
-  - [Global threshold configuration](#global-threshold-configuration)
+  - [Coupling script interrupt threshold to observer `durationThreshold`](#coupling-script-interrupt-threshold-to-observer-durationthreshold)
+- [Future Work: Configurable Sub-50ms `durationThreshold` for LoAF](#future-work-configurable-sub-50ms-durationthreshold-for-loaf)
 - [Security and Privacy Considerations](#security-and-privacy-considerations)
 - [Stakeholder Feedback / Opposition](#stakeholder-feedback--opposition)
 - [References & acknowledgements](#references--acknowledgements)
@@ -52,18 +53,17 @@ feedback on the proposed solution. It has not been approved to ship in Chrome.
 
 Modern web applications strive for smooth, responsive user interfaces. However, developers often struggle to identify and eliminate "jank"—stutters caused by JavaScript tasks hogging the main thread.
 
-While the **Long Animation Frames (LoAF) API** (`long-animation-frame`) provides valuable visibility into long frames (>50ms) and attributes scripts by their outer entry point (`invoker`, `sourceURL`, `sourceFunctionName`), two key diagnostic gaps remain:
+While the **Long Animation Frames (LoAF) API** (`long-animation-frame`) provides valuable visibility into long frames ($\ge 50\text{ms}$) and attributes scripts by their outer entry point (`invoker`, `sourceURL`, `sourceFunctionName`), a key diagnostic gap remains:
 
-1. **Leaf-level execution visibility (Wrapper / RUM blindspot):** Entry-point attribution only identifies the outer callback or event listener that started a script. When applications use framework schedulers, state batchers, or RUM/telemetry error wrappers (e.g., `Function.prototype.apply` wrappers), `PerformanceScriptTiming` attributes the entire duration to the outer wrapper rather than the inner leaf function that was actually burning CPU cycles when the budget was breached.
-2. **Sub-50ms smoothness budgets:** Developers enforcing 60Hz/120Hz frame budgets or diagnosing main-thread contention prior to a full 50ms frame drop lack a way to lower the observation threshold (e.g., down to 10ms–15ms).
+* **Leaf-level execution visibility (Wrapper / RUM blindspot):** Entry-point attribution only identifies the outer callback or event listener that started a script. When applications use framework schedulers, state batchers, or RUM/telemetry error wrappers (e.g., `Function.prototype.apply` wrappers), `PerformanceScriptTiming` attributes the entire duration to the outer wrapper rather than the inner leaf function that was actually burning CPU cycles when the budget was breached.
 
-Following feedback from the W3C Web Performance Working Group at TPAC 2026, this proposal extends **Long Animation Frames (`long-animation-frame`)** with an opt-in `takeTracing` flag, configurable `durationThreshold`, and a `stackTrace` attribute on `PerformanceScriptTiming`. When a script exceeds the configured threshold, the browser triggers a lightweight mid-execution interrupt to capture a point-in-time call stack of the offending script.
+Following feedback from the W3C Web Performance Working Group at TPAC 2026, this proposal extends **Long Animation Frames (`long-animation-frame`)** with an opt-in `takeTracing` flag on `PerformanceObserverInit` and a `stackTrace` attribute on `PerformanceScriptTiming`. When a script exceeds a predetermined execution threshold (e.g., `7ms`), the browser triggers a lightweight mid-execution interrupt to capture a point-in-time call stack of the offending script.
 
 
 ## Goals
 
-* Extend `PerformanceScriptTiming` (within `long-animation-frame`) to expose the point-in-time JavaScript call stack (`stackTrace`) captured when a script exceeds its execution threshold.
-* Allow `PerformanceObserver` instances observing `"long-animation-frame"` to configure a custom `durationThreshold` (subject to a UA minimum clamp for OS timer/power constraints) and opt into stack capture via `takeTracing: true`.
+* Extend `PerformanceScriptTiming` (within `long-animation-frame`) to expose the point-in-time JavaScript call stack (`stackTrace`) captured when a script exceeds a predetermined execution threshold.
+* Allow `PerformanceObserver` instances observing `"long-animation-frame"` to opt into stack capture via `takeTracing: true`.
 * Ensure the detection and observation mechanisms have zero main-thread overhead on healthy tasks and minimal one-time overhead when a threshold breach occurs.
 
 
@@ -71,6 +71,7 @@ Following feedback from the W3C Web Performance Working Group at TPAC 2026, this
 
 * **Replacing DevTools Profilers:** This API is for programmatic, lightweight threshold-breach monitoring in the wild, not for capturing full continuous CPU flamegraphs across healthy execution.
 * **Reviving legacy `PerformanceLongTaskTiming`:** Rather than adding new capabilities to legacy `"longtask"` entries, this proposal builds on the modern Long Animation Frames (`long-animation-frame`) standard.
+* **Changing LoAF's overall frame `durationThreshold` in this feature:** Allowing `"long-animation-frame"` observers to configure a sub-50ms frame `durationThreshold` is an orthogonal capability and is tracked separately from `takeTracing` and `PerformanceScriptTiming.stackTrace`.
 
 
 ## Use cases
@@ -80,9 +81,9 @@ This proposal is driven by both the performance requirements of the **Webium Pro
 
 ### Use case 1: Diagnosing micro-stutters in the Webium Product
 
-In the Webium Product, even moderate synchronous scripts (e.g., 10ms–20ms) can cause noticeable stutters if they occur during critical rendering or interaction phases. The project needs to enforce strict sub-50ms budgets and understand exactly which inner JavaScript function is blocking the thread at the moment the budget is breached.
+In the Webium Product, synchronous scripts (e.g., `10ms–20ms` scripts contributing to a long animation frame) can cause noticeable stutters during critical rendering or interaction phases. Engineers need to understand exactly which inner JavaScript function is blocking the thread at the moment a script exceeds its budget.
 
-Entry-point attribution alone (`TimerHandler:setTimeout` or an outer Lit/Mojo dispatcher) is insufficient when hundreds of different handlers funnel through a shared dispatcher. By capturing a point-in-time `stackTrace` on `PerformanceScriptTiming` when the threshold is exceeded, engineers can pinpoint and eliminate the exact source of main-thread contention.
+Entry-point attribution alone (`TimerHandler:setTimeout` or an outer Lit/Mojo dispatcher) is insufficient when hundreds of different handlers funnel through a shared dispatcher. By capturing a point-in-time `stackTrace` on `PerformanceScriptTiming` when the script execution threshold is exceeded, engineers can pinpoint and eliminate the exact source of main-thread contention.
 
 ### Use case 2: Real User Monitoring (RUM) and Wrapper-Resilient Attribution
 
@@ -93,13 +94,12 @@ Exposing `stackTrace` directly on `PerformanceScriptTiming` allows RUM scripts t
 
 ## Proposed Solution: Extending Long Animation Frames (LoAF)
 
-When a `"long-animation-frame"` observer opts in via `takeTracing: true`, a background watchdog tracks main-thread script execution duration. If a script continues past a single predetermined script interrupt threshold (e.g., `7ms` in the Chromium prototype, slightly above LoAF's `5ms` long-script threshold and common scheduler yield quantums), the browser requests a one-shot interrupt from the JavaScript engine. At the next safe point, the engine captures the current call stack, applies LoAF's opaque-script filtering rules, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry. Independently, `durationThreshold` on `PerformanceObserver.observe()` acts purely as an observer filter for the overall LoAF animation frame duration (allowing observers to receive frames shorter than the `50ms` default).
+When a `"long-animation-frame"` observer opts in via `takeTracing: true`, a background watchdog tracks main-thread script execution duration. If a script continues past a single predetermined script interrupt threshold (e.g., `7ms` in the Chromium prototype, slightly above LoAF's `5ms` long-script threshold and common scheduler yield quantums), the browser requests a one-shot interrupt from the JavaScript engine. At the next safe point, the engine captures the current call stack, applies LoAF's opaque-script filtering rules, and attaches the resulting `stackTrace` to the active `PerformanceScriptTiming` entry.
 
 ### WebIDL
 
 ```webidl
 partial dictionary PerformanceObserverInit {
-    DOMHighResTimeStamp durationThreshold;
     boolean takeTracing = false;
 };
 
@@ -148,7 +148,6 @@ const observer = new PerformanceObserver((list) => {
 
 observer.observe({
   type: 'long-animation-frame',
-  durationThreshold: 15,
   takeTracing: true,
 });
 ```
@@ -160,13 +159,11 @@ observer.observe({
 
 LoAF's existing `PerformanceScriptTiming` records post-mortem entry-point attribution ("Callback X ran for 65ms total"), whereas a threshold interrupt captures a point-in-time snapshot of the call stack at the moment the budget is breached. Combining both on `PerformanceScriptTiming` avoids forcing developers to choose between knowing *what initiated the work* (`invoker` / `sourceURL`) and *what inner function was hogging the CPU* (`stackTrace`).
 
-### OS timer resolution clamping (10ms–15ms), battery life, and side channels
+### Predetermined script interrupt threshold, battery life, and side channels
 
-LoAF already records scripts $\ge 5\text{ms}$, and many userland schedulers treat `5ms` as their standard yield quantum. Setting a single predetermined script interrupt threshold slightly above that boundary (e.g., `6ms–10ms`) avoids interrupting tasks that are just about to yield while ensuring that any long script inside a LoAF frame (even a `15ms` script inside a default `50ms` frame) receives a stack trace.
+LoAF already records scripts $\ge 5\text{ms}$, and many userland schedulers treat `5ms` as their standard yield quantum. Using a single predetermined script interrupt threshold slightly above that boundary (e.g., `6ms–10ms`; `7ms` in the Chromium prototype) avoids interrupting tasks that are just about to yield while ensuring that any long script inside a LoAF frame (even a `15ms` script inside a `50ms` frame) receives a stack trace.
 
-On Windows, the default OS system tick interval is `15.625ms` (64 Hz); while modern Windows 10 (1803+) provides [`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createwaitabletimerexw) for short waitable timer delays without globally raising the system tick via `timeBeginPeriod`, user agents must still avoid battery regressions or leaking power/timer state across configurations:
-* **Production minimum clamp:** User agents use a fixed predetermined script interrupt interval (e.g., `6ms–10ms`) and clamp `durationThreshold` to a fixed minimum (e.g., `10ms–15ms`) in normal production browsing.
-* **Developer mode / local debugging override:** For local lab profiling or controlled internal environments (such as Webium development builds), browsers may offer a local developer flag or policy override to allow lower thresholds without affecting general web battery life.
+On Windows, the default OS system tick interval is `15.625ms` (64 Hz), while modern Windows 10 (1803+) provides [`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createwaitabletimerexw) for short waitable timer delays without globally raising the system tick via `timeBeginPeriod`. Keeping the script interrupt interval UA-defined (rather than exposing arbitrary sub-millisecond timer intervals to script) prevents battery regressions and high-frequency sampling side channels.
 
 ### Lazy stack symbolization and slow-device guardrails
 
@@ -174,15 +171,15 @@ To minimize in-band pause time when an interrupt fires—especially on slower de
 1. **Lazy stack symbolization:** During the JS engine safe-point interrupt, the browser only records lightweight frame references (or `(script_id, bytecode_offset)` pairs) without URL normalization, opaque-script filtering, or string formatting, deferring symbolization and formatting until after the script finishes. (If a script is garbage-collected before lazy symbolization occurs, affected frames degrade gracefully.)
 2. **Slow-device guardrails (breach-storm rate limiting):** On low-end devices experiencing continuous back-to-back threshold breaches, the user agent can apply a token-bucket cooldown so excess breaches continue reporting LoAF timing metrics while temporarily skipping stack capture interrupts.
 
-### Handling multiple observers with different thresholds
+### Single capture per script across observers
 
-Because the script interrupt fires at a **single predetermined script duration** whenever tracing is active—rather than at each observer's `durationThreshold`—the browser captures **at most one stack trace per script** and shares it across all `takeTracing: true` observers, while each observer's `durationThreshold` (e.g., Observer A at `15ms` and Observer B at `50ms`) simply controls which LoAF frames that observer receives. This decoupling ensures both that shorter scripts (`10ms–20ms`) inside a `50ms` frame still get stack traces and that staggered observer thresholds (`10, 11, 12ms`) cannot be used as a high-frequency sampling profiler.
+Because the script interrupt fires at a **single predetermined script duration** whenever tracing is active, the browser captures **at most one stack trace per script** and shares it across all `takeTracing: true` observers. This ensures both that shorter scripts (`10ms–20ms`) inside a `50ms` frame still get stack traces and that multiple observers cannot be used to trigger repeated interrupts within a single script execution.
 
 ### Lock-free task observation and zero-CPU idle suspension
 
 Because the browser tracks every task/script on the main thread, heavy thread synchronization on every task boundary would regress performance:
-* **Fast-path main-thread bookkeeping:** Task start and end state is updated with minimal main-thread overhead.
-* **Zero polling when idle (`CondVar::Wait` / `TimedWait`):** Rather than polling continuously, the background watchdog thread parks on a condition variable (`cv.Wait()`) when the main thread is idle (consuming `0%` CPU) and sleeps for the exact remaining budget (`cv.TimedWait(threshold - elapsed)`) when a task is running, waking the JS engine at most once per breached threshold.
+* **Fast-path main-thread bookkeeping:** Script start and end state is updated with minimal main-thread overhead.
+* **Zero polling when idle (`CondVar::Wait` / `TimedWait`):** Rather than polling continuously, the background watchdog thread parks on a condition variable (`cv.Wait()`) when the main thread is idle (consuming `0%` CPU) and sleeps for the exact remaining budget (`cv.TimedWait(threshold - elapsed)`) when a script is running, waking the JS engine at most once per breached script threshold.
 
 
 ## Considered alternatives
@@ -209,9 +206,26 @@ We also evaluated whether threshold-triggered stack capture should be part of th
 1. **Cross-browser adoption:** Other browser vendors (such as Mozilla) have indicated they do not plan to implement the JS Self-Profiling API, whereas LoAF is the standards-track path for main-thread responsiveness.
 2. **Lifecycle & policy header:** `Profiler` requires an explicit start/stop buffer lifecycle and a `Document-Policy: js-profiling` response header, whereas LoAF streams via `PerformanceObserver` and protects cross-origin scripts via stack frame truncation without requiring document-level headers.
 
-### Global threshold configuration
+### Coupling script interrupt threshold to observer `durationThreshold`
 
-A global setter such as `performance.setInterruptDuration(ms)` was rejected because multiple independent scripts on a page (e.g., first-party telemetry and a third-party RUM provider) would overwrite each other's global threshold. Scoping `durationThreshold` to `PerformanceObserver.observe()` avoids global state collisions.
+We initially considered using `PerformanceObserverInit.durationThreshold` both to lower LoAF's `50ms` frame threshold and to set the script interrupt timer. However, a `50ms` LoAF frame frequently consists of multiple shorter scripts (e.g., three `18ms` scripts), so tying the script interrupt timer to `50ms` would miss all three scripts under the default threshold, while allowing multiple observers with staggered thresholds (`10, 11, 12ms`) could be abused as a sampling profiler. Using a single predetermined per-script interrupt threshold (`7ms`) and keeping configurable LoAF frame `durationThreshold` as a separate, orthogonal feature avoids both issues.
+
+
+## Future Work: Configurable Sub-50ms `durationThreshold` for LoAF
+
+While `takeTracing: true` with a predetermined per-script interrupt threshold (`7ms`) already captures call stacks for $\ge 7\text{ms}$ scripts inside standard $\ge 50\text{ms}$ Long Animation Frames, LoAF currently discards animation frames whose *total* duration is under `50ms`.
+
+As a separate follow-up feature, we plan to explore honoring `PerformanceObserverInit.durationThreshold` on `"long-animation-frame"` observers (subject to a UA minimum clamp such as `10ms–15ms` for OS timer and battery constraints, with a local developer override for lab profiling):
+
+```javascript
+observer.observe({
+  type: 'long-animation-frame',
+  durationThreshold: 15, // Future follow-up: observe >= 15ms animation frames
+  takeTracing: true,
+});
+```
+
+This companion capability is valuable both independently (for developers enforcing 60Hz/120Hz frame smoothness budgets below `50ms` using standard LoAF attribution) and together with `takeTracing` (so an isolated `15ms–30ms` janky script is reported even when the overall animation frame completes in under `50ms`).
 
 
 ## Security and Privacy Considerations
@@ -230,7 +244,7 @@ Exposing JavaScript stack traces must preserve Long Animation Frames' existing [
 ## Stakeholder Feedback / Opposition
 
 - **Chrome / WebUI (Webium):** Positive (Driving initial incubation and prototype)
-- **W3C Web Performance WG (TPAC 2026):** Discussed on Oct 29, 2026; consensus to prototype extending **Long Animation Frames (LoAF)** rather than legacy `longtask` or a standalone entry type, with a `10ms–15ms` OS timer clamp and exploration of lazy stack symbolization.
+- **W3C Web Performance WG (TPAC 2026):** Discussed on Oct 29, 2026; consensus to prototype extending **Long Animation Frames (LoAF)** rather than legacy `longtask` or a standalone entry type, using a predetermined script interrupt threshold (`6ms–10ms`) and lazy stack symbolization.
 
 ## References & acknowledgements
 
@@ -249,12 +263,12 @@ Many thanks for valuable feedback and advice from:
 
 ## Appendix: Implementation Feasibility (Chromium Prototype)
 
-We built and verified an end-to-end Chromium prototype extending `TaskInterruptMonitor`, LoAF's `PerformanceScriptTiming.stackTrace`, and configurable sub-50ms `durationThreshold` on `"long-animation-frame"` observers ([CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720), stacked on [CL 8350623](https://chromium-review.googlesource.com/c/chromium/src/+/8350623)):
+We built and verified an end-to-end Chromium prototype extending `TaskInterruptMonitor` and LoAF's `PerformanceScriptTiming.stackTrace` on `"long-animation-frame"` observers ([CL 8683720](https://chromium-review.googlesource.com/c/chromium/src/+/8683720), stacked on [CL 8350623](https://chromium-review.googlesource.com/c/chromium/src/+/8350623)):
 
-* **Healthy Tasks (`< durationThreshold` — `0.00 ms` Overhead):**
-  Tasks that complete within the threshold trigger zero V8 interrupts and incur `0.00 ms` (`0%`) main-thread overhead.
+* **Healthy Scripts (`< 7ms` — `0.00 ms` Overhead):**
+  Scripts that complete within the `7ms` interrupt threshold trigger zero V8 interrupts and incur `0.00 ms` (`0%`) main-thread overhead.
 * **Watchdog Thread (`0%` CPU When Idle):**
-  The watchdog thread blocks on a condition variable (`cv.Wait()`) when no main-thread task is running (`0%` CPU) and uses `cv.TimedWait()` for the remaining threshold duration when a task starts.
+  The watchdog thread blocks on a condition variable (`cv.Wait()`) when no main-thread script is running (`0%` CPU) and uses `cv.TimedWait()` for the remaining threshold duration when a script starts.
 * **V8 Safe-Point Capture Cost (`55 µs–93 µs` with Lazy Symbolization — 52%–64% Reduction):**
   Deferring opaque-frame truncation, URL filtering, and `StringBuilder` string formatting out of `TaskInterruptMonitor::OnInterrupt()` until script/task completion cuts the in-band V8 safe-point pause by **52%–64%** across call stack depths in Release builds (`is_debug=false`, `dcheck_always_on=false`):
 
